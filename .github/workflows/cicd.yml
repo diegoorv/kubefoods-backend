@@ -1,89 +1,107 @@
-name: CI/CD Kubefoods Backend
+steps:
+  - name: Checkout repository
+    uses: actions/checkout@v4
 
-on:
-  push:
-    branches: [ "main" ]
+  - name: Prepare IMAGE_NAME and TAG
+    id: prep
+    run: |
+      # Preferir la secret, si no está usar GITHUB_REPOSITORY como fallback
+      IMAGE_NAME="${{ secrets.DOCKER_REPO }}"
+      if [ -z "$IMAGE_NAME" ]; then
+        echo "INFO: secrets.DOCKER_REPO empty, using GITHUB_REPOSITORY as fallback"
+        IMAGE_NAME="${GITHUB_REPOSITORY}"
+      fi
 
-jobs:
-  build-deploy-validate:
-    runs-on: ubuntu-latest
+      if [ -z "$IMAGE_NAME" ]; then
+        echo "ERROR: IMAGE_NAME is empty. Set the secret 'DOCKER_REPO' to 'youruser/kubefoods-backend' or ensure GITHUB_REPOSITORY is available."
+        exit 1
+      fi
 
-    env:
-      # Preferir la secret, si quieres probar localmente descomenta la línea de abajo
-      IMAGE_NAME: ${{ secrets.DOCKER_REPO }}
-      TAG: v${{ github.run_number }}
-      # IMAGE_NAME: yourdockeruser/kubefoods-backend  # <-- solo para pruebas locales, NO en producción
+      # IMAGE_NAME debe tener formato user/repo
+      if ! echo "$IMAGE_NAME" | grep -q "/"; then
+        echo "ERROR: IMAGE_NAME does not look like 'user/repo'. Value: $IMAGE_NAME"
+        exit 1
+      fi
 
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      # Determinar TAG:
+      # Prioridad: variable de entorno TAG (si se pasó), luego ref (tag o branch), luego fallback con run number
+      TAG="${TAG:-}"
 
-      - name: Validate required secrets and variables
-        run: |
-          # Verificamos que IMAGE_NAME no esté vacío y que tenga formato "user/repo"
-          if [ -z "${IMAGE_NAME}" ]; then
-            echo "ERROR: IMAGE_NAME (DOCKER_REPO secret) is empty. Set the secret 'DOCKER_REPO' to a value like 'youruser/kubefoods-backend'."
-            exit 1
-          fi
-          # Simple sanity check: debe contener al menos una barra
-          if ! echo "${IMAGE_NAME}" | grep -q "/"; then
-            echo "ERROR: IMAGE_NAME does not look like a repository (expected 'user/repo'). Value: ${IMAGE_NAME}"
-            exit 1
-          fi
-          # TAG sanity: remover prefijos inválidos o espacios
-          if echo "${TAG}" | grep -q "^:"; then
-            echo "ERROR: TAG starts with ':' which would create an invalid tag. TAG=${TAG}"
-            exit 1
-          fi
-        shell: bash
+      if [ -z "$TAG" ]; then
+        REF="${GITHUB_REF:-}"
+        if [[ "$REF" =~ ^refs/tags/ ]]; then
+          TAG="${REF#refs/tags/}"
+        elif [[ "$REF" =~ ^refs/heads/ ]]; then
+          TAG="${REF#refs/heads/}"
+        fi
+      fi
 
-      - name: Set up QEMU (for multi-arch, optional)
-        uses: docker/setup-qemu-action@v2
+      if [ -z "$TAG" ]; then
+        TAG="v${GITHUB_RUN_NUMBER:-${GITHUB_RUN_ID:-1}}"
+      fi
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v2
+      # Saneamiento: quitar ':' o espacios al inicio que provoquen tags inválidos como ":v9"
+      TAG="$(echo "$TAG" | sed 's/^[[:space:]:]\+//')"
+      if [ -z "$TAG" ]; then
+        TAG="latest"
+      fi
 
-      - name: Log in to Docker Hub
-        uses: docker/login-action@v2
-        with:
-          username: ${{ secrets.DOCKERHUB_USER }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      echo "Computed IMAGE_NAME=$IMAGE_NAME"
+      echo "Computed TAG=$TAG"
 
-      - name: Build and push image
-        uses: docker/build-push-action@v4
-        with:
-          context: .
-          file: ./Dockerfile
-          push: true
-          # build-push-action acepta una lista separada por comas
-          tags: ${{ env.IMAGE_NAME }}:${{ env.TAG }},${{ env.IMAGE_NAME }}:latest
-          # Opcional: platforms: linux/amd64,linux/arm64
+      # Exponer como outputs para usarlos en pasos posteriores
+      echo "image=$IMAGE_NAME" >> "$GITHUB_OUTPUT"
+      echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+    shell: bash
 
-      - name: Set kubeconfig
-        run: |
-          mkdir -p ~/.kube
-          echo "${{ secrets.KUBECONFIG }}" > ~/.kube/config
+  - name: Set up QEMU (for multi-arch, optional)
+    uses: docker/setup-qemu-action@v2
 
-      - name: Update Deployment image
-        run: |
-          kubectl set image deployment/kubefoods-backend backend=${{ env.IMAGE_NAME }}:${{ env.TAG }}
-      
-      - name: Wait for rollout
-        run: |
-          kubectl rollout status deployment/kubefoods-backend --timeout=2m
+  - name: Set up Docker Buildx
+    uses: docker/setup-buildx-action@v2
 
-      - name: Validate service health
-        id: validate
-        run: |
-          URL="${{ secrets.SERVICE_URL }}"
-          STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$URL")
-          echo "STATUS=$STATUS"
-          if [ "$STATUS" -ne 200 ]; then
-            echo "Service health check failed with status $STATUS"
-            exit 1
-          fi
+  - name: Log in to Docker Hub
+    uses: docker/login-action@v2
+    with:
+      username: ${{ secrets.DOCKERHUB_USER }}
+      password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Rollback Deployment
-        if: failure() && steps.validate.outcome == 'failure'
-        run: |
-          kubectl rollout undo deployment/kubefoods-backend
+  - name: Build and push image
+    uses: docker/build-push-action@v4
+    with:
+      context: .
+      file: ./Dockerfile
+      push: true
+      tags: |
+        ${{ steps.prep.outputs.image }}:${{ steps.prep.outputs.tag }}
+        ${{ steps.prep.outputs.image }}:latest
+      # platforms: linux/amd64,linux/arm64  # descomentar si hace falta
+
+  - name: Set kubeconfig
+    run: |
+      mkdir -p ~/.kube
+      echo "${{ secrets.KUBECONFIG }}" > ~/.kube/config
+
+  - name: Update Deployment image
+    run: |
+      kubectl set image deployment/kubefoods-backend backend=${{ steps.prep.outputs.image }}:${{ steps.prep.outputs.tag }}
+
+  - name: Wait for rollout
+    run: |
+      kubectl rollout status deployment/kubefoods-backend --timeout=2m
+
+  - name: Validate service health
+    id: validate
+    run: |
+      URL="${{ secrets.SERVICE_URL }}"
+      STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$URL")
+      echo "STATUS=$STATUS"
+      if [ "$STATUS" -ne 200 ]; then
+        echo "Service health check failed with status $STATUS"
+        exit 1
+      fi
+
+  - name: Rollback Deployment
+    if: failure() && steps.validate.outcome == 'failure'
+    run: |
+      kubectl rollout undo deployment/kubefoods-backend
