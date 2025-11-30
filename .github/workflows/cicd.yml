@@ -20,9 +20,13 @@ jobs:
         run: |
           echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u "${{ secrets.DOCKERHUB_USER }}" --password-stdin
 
+      - name: Enable Docker Buildx
+        run: |
+          docker buildx create --use
+
       - name: Build Docker image
         run: |
-          docker build -t $IMAGE_NAME:$TAG .
+          docker buildx build --load -t $IMAGE_NAME:$TAG .
 
       - name: Push Docker image
         run: |
@@ -55,4 +59,3 @@ jobs:
         if: failure() && steps.validate.outcome == 'failure'
         run: |
           kubectl rollout undo deployment/kubefoods-backend
-
