@@ -9,12 +9,33 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
+      # Preferir la secret, si quieres probar localmente descomenta la línea de abajo
       IMAGE_NAME: ${{ secrets.DOCKER_REPO }}
       TAG: v${{ github.run_number }}
+      # IMAGE_NAME: yourdockeruser/kubefoods-backend  # <-- solo para pruebas locales, NO en producción
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Validate required secrets and variables
+        run: |
+          # Verificamos que IMAGE_NAME no esté vacío y que tenga formato "user/repo"
+          if [ -z "${IMAGE_NAME}" ]; then
+            echo "ERROR: IMAGE_NAME (DOCKER_REPO secret) is empty. Set the secret 'DOCKER_REPO' to a value like 'youruser/kubefoods-backend'."
+            exit 1
+          fi
+          # Simple sanity check: debe contener al menos una barra
+          if ! echo "${IMAGE_NAME}" | grep -q "/"; then
+            echo "ERROR: IMAGE_NAME does not look like a repository (expected 'user/repo'). Value: ${IMAGE_NAME}"
+            exit 1
+          fi
+          # TAG sanity: remover prefijos inválidos o espacios
+          if echo "${TAG}" | grep -q "^:"; then
+            echo "ERROR: TAG starts with ':' which would create an invalid tag. TAG=${TAG}"
+            exit 1
+          fi
+        shell: bash
 
       - name: Set up QEMU (for multi-arch, optional)
         uses: docker/setup-qemu-action@v2
@@ -34,8 +55,9 @@ jobs:
           context: .
           file: ./Dockerfile
           push: true
-          tags: ${{ env.IMAGE_NAME }}:${{ env.TAG }}
-          # si no quieres push directo, usa push: false y añade un step docker push manualmente
+          # build-push-action acepta una lista separada por comas
+          tags: ${{ env.IMAGE_NAME }}:${{ env.TAG }},${{ env.IMAGE_NAME }}:latest
+          # Opcional: platforms: linux/amd64,linux/arm64
 
       - name: Set kubeconfig
         run: |
@@ -45,7 +67,7 @@ jobs:
       - name: Update Deployment image
         run: |
           kubectl set image deployment/kubefoods-backend backend=${{ env.IMAGE_NAME }}:${{ env.TAG }}
-
+      
       - name: Wait for rollout
         run: |
           kubectl rollout status deployment/kubefoods-backend --timeout=2m
@@ -54,9 +76,10 @@ jobs:
         id: validate
         run: |
           URL="${{ secrets.SERVICE_URL }}"
-          STATUS=$(curl -s -o /dev/null -w "%{http_code}" $URL)
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$URL")
           echo "STATUS=$STATUS"
           if [ "$STATUS" -ne 200 ]; then
+            echo "Service health check failed with status $STATUS"
             exit 1
           fi
 
