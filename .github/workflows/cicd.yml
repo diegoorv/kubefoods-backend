@@ -55,3 +55,4 @@ jobs:
         if: failure() && steps.validate.outcome == 'failure'
         run: |
           kubectl rollout undo deployment/kubefoods-backend
+
